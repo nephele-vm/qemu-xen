@@ -1622,3 +1622,23 @@
 ##
 { 'event': 'UNPLUG_PRIMARY',
   'data': { 'device-id': 'str' } }
+
+##
+# @xen-clone:
+#
+# Clone VM
+#
+# @domid: Cloned domain ID
+#
+# @parentid: Parent domain ID
+#
+# Returns: nothing on success
+#
+# Example:
+#
+# -> { "execute": "xen-clone",
+#      "arguments": { "domid": 17, "parentid": 16 } }
+# <- { "return": {} }
+#
+##
+{ 'command': 'xen-clone', 'data': {'domid': 'int', 'parentid': 'int'} }
