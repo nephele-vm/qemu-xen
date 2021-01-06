@@ -23,6 +23,7 @@ struct XenDevOps {
     void      (*event)(struct XenLegacyDevice *xendev);
     void      (*disconnect)(struct XenLegacyDevice *xendev);
     int       (*free)(struct XenLegacyDevice *xendev);
+    int       (*clone)(struct XenLegacyDevice *xendev);
     void      (*backend_changed)(struct XenLegacyDevice *xendev,
                                  const char *node);
     void      (*frontend_changed)(struct XenLegacyDevice *xendev,
@@ -49,6 +50,9 @@ struct XenLegacyDevice {
 
     xenevtchn_handle   *evtchndev;
     xengnttab_handle   *gnttabdev;
+
+    struct XenLegacyDevice *parent;
+    int                is_clone;
 
     struct XenDevOps   *ops;
     QTAILQ_ENTRY(XenLegacyDevice) next;

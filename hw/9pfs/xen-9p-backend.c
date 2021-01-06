@@ -379,13 +379,20 @@ static int xen_9pfs_connect(struct XenLegacyDevice *xendev)
     Error *err = NULL;
     int i;
     Xen9pfsDev *xen_9pdev = container_of(xendev, Xen9pfsDev, xendev);
+    Xen9pfsDev *parent_xen_9pdev = xendev->parent ?
+            container_of(xendev->parent, Xen9pfsDev, xendev) : NULL;
     V9fsState *s = &xen_9pdev->state;
     QemuOpts *fsdev;
 
-    if (xenstore_read_fe_int(&xen_9pdev->xendev, "num-rings",
-                             &xen_9pdev->num_rings) == -1 ||
-        xen_9pdev->num_rings > MAX_RINGS || xen_9pdev->num_rings < 1) {
-        return -1;
+    if (parent_xen_9pdev)
+        xen_9pdev->num_rings = parent_xen_9pdev->num_rings;
+
+    else {
+        if (xenstore_read_fe_int(&xen_9pdev->xendev, "num-rings",
+                                 &xen_9pdev->num_rings) == -1 ||
+            xen_9pdev->num_rings > MAX_RINGS || xen_9pdev->num_rings < 1) {
+            return -1;
+        }
     }
 
     xen_9pdev->rings = g_new0(Xen9pfsRing, xen_9pdev->num_rings);
@@ -397,20 +404,26 @@ static int xen_9pfs_connect(struct XenLegacyDevice *xendev)
         xen_9pdev->rings[i].evtchn = -1;
         xen_9pdev->rings[i].local_port = -1;
 
-        str = g_strdup_printf("ring-ref%u", i);
-        if (xenstore_read_fe_int(&xen_9pdev->xendev, str,
-                                 &xen_9pdev->rings[i].ref) == -1) {
+        if (parent_xen_9pdev) {
+            xen_9pdev->rings[i].ref = parent_xen_9pdev->rings[i].ref;
+            xen_9pdev->rings[i].evtchn = parent_xen_9pdev->rings[i].evtchn;
+
+        } else {
+            str = g_strdup_printf("ring-ref%u", i);
+            if (xenstore_read_fe_int(&xen_9pdev->xendev, str,
+                                     &xen_9pdev->rings[i].ref) == -1) {
+                g_free(str);
+                goto out;
+            }
             g_free(str);
-            goto out;
-        }
-        g_free(str);
-        str = g_strdup_printf("event-channel-%u", i);
-        if (xenstore_read_fe_int(&xen_9pdev->xendev, str,
-                                 &xen_9pdev->rings[i].evtchn) == -1) {
+            str = g_strdup_printf("event-channel-%u", i);
+            if (xenstore_read_fe_int(&xen_9pdev->xendev, str,
+                                     &xen_9pdev->rings[i].evtchn) == -1) {
+                g_free(str);
+                goto out;
+            }
             g_free(str);
-            goto out;
         }
-        g_free(str);
 
         xen_9pdev->rings[i].intf =
             xen_be_map_grant_ref(&xen_9pdev->xendev,
@@ -462,11 +475,19 @@ static int xen_9pfs_connect(struct XenLegacyDevice *xendev)
                 xen_9pfs_evtchn_event, NULL, &xen_9pdev->rings[i]);
     }
 
-    xen_9pdev->security_model = xenstore_read_be_str(xendev, "security_model");
-    xen_9pdev->path = xenstore_read_be_str(xendev, "path");
+    if (parent_xen_9pdev) {
+        xen_9pdev->security_model = strdup(parent_xen_9pdev->security_model);
+        xen_9pdev->path = strdup(parent_xen_9pdev->path);
+        xen_9pdev->tag = s->fsconf.tag = strdup(parent_xen_9pdev->tag);
+
+    } else {
+        xen_9pdev->security_model = xenstore_read_be_str(xendev, "security_model");
+        xen_9pdev->path = xenstore_read_be_str(xendev, "path");
+        xen_9pdev->tag = s->fsconf.tag = xenstore_read_fe_str(xendev, "tag");
+    }
+
     xen_9pdev->id = s->fsconf.fsdev_id =
         g_strdup_printf("xen9p%d", xendev->dev);
-    xen_9pdev->tag = s->fsconf.tag = xenstore_read_fe_str(xendev, "tag");
     fsdev = qemu_opts_create(qemu_find_opts("fsdev"),
             s->fsconf.tag,
             1, NULL);
@@ -479,6 +500,22 @@ static int xen_9pfs_connect(struct XenLegacyDevice *xendev)
         error_report_err(err);
     }
     v9fs_device_realize_common(s, &xen_9p_transport, NULL);
+
+    if (xendev->is_clone) {
+        for (i = 0; i < xen_9pdev->num_rings; i++)
+            v9fs_attach_on_clone(&xen_9pdev->rings[i].priv->state);
+
+        V9fsState *s_prnt = &parent_xen_9pdev->state;
+        V9fsFidState *f_prnt;
+
+        /* Clone fids */
+        for (f_prnt = s_prnt->fid_list; f_prnt; f_prnt = f_prnt->next) {
+            if (f_prnt->fid == 0)
+                continue;
+            if (clone_fid(s, f_prnt))
+                break;
+        }
+    }
 
     return 0;
 
@@ -502,4 +539,5 @@ struct XenDevOps xen_9pfs_ops = {
     .initialise = xen_9pfs_connect,
     .disconnect = xen_9pfs_disconnect,
     .free       = xen_9pfs_free,
+    .clone      = xen_9pfs_connect,
 };

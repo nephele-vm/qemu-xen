@@ -442,4 +442,7 @@ struct V9fsTransport {
     void        (*push_and_notify)(V9fsPDU *pdu);
 };
 
+int clone_fid(V9fsState *s, V9fsFidState *f_prnt);
+ssize_t v9fs_attach_on_clone(V9fsState *s);
+
 #endif

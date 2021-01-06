@@ -29,6 +29,7 @@
 #include "hw/qdev-properties.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
+#include "qapi/qapi-commands-migration.h"
 #include "qapi/error.h"
 #include "hw/xen/xen-legacy-backend.h"
 #include "hw/xen/xen_pvdev.h"
@@ -128,7 +129,7 @@ void *xen_be_map_grant_refs(struct XenLegacyDevice *xendev, uint32_t *refs,
     assert(xendev->ops->flags & DEVOPS_FLAG_NEED_GNTDEV);
 
     ptr = xengnttab_map_domain_grant_refs(xendev->gnttabdev, nr_refs,
-                                          xen_domid, refs, prot);
+                                          xendev->dom, refs, prot);
     if (!ptr) {
         xen_pv_printf(xendev, 0,
                       "xengnttab_map_domain_grant_refs failed: %s\n",
@@ -259,14 +260,17 @@ int xen_be_copy_grant_refs(struct XenLegacyDevice *xendev,
     return rc;
 }
 
+static int xen_be_try_clone(struct XenLegacyDevice *xendev);
+
 /*
  * get xen backend device, allocate a new one if it doesn't exist.
  */
 static struct XenLegacyDevice *xen_be_get_xendev(const char *type, int dom,
+                                                 int parentdom,
                                                  int dev,
                                                  struct XenDevOps *ops)
 {
-    struct XenLegacyDevice *xendev;
+    struct XenLegacyDevice *xendev, *parent;
 
     xendev = xen_pv_find_xendev(type, dom, dev);
     if (xendev) {
@@ -277,7 +281,7 @@ static struct XenLegacyDevice *xen_be_get_xendev(const char *type, int dom,
     xendev = g_malloc0(ops->size);
     object_initialize(&xendev->qdev, ops->size, TYPE_XENBACKEND);
     OBJECT(xendev)->free = g_free;
-    qdev_set_id(DEVICE(xendev), g_strdup_printf("xen-%s-%d", type, dev));
+    qdev_set_id(DEVICE(xendev), g_strdup_printf("xen-%d-%s-%d", dom, type, dev));
     qdev_realize(DEVICE(xendev), xen_sysbus, &error_fatal);
     object_unref(OBJECT(xendev));
 
@@ -304,6 +308,14 @@ static struct XenLegacyDevice *xen_be_get_xendev(const char *type, int dom,
 
     xen_pv_insert_xendev(xendev);
 
+    if (parentdom > 0) {
+        parent = xen_pv_find_xendev(type, parentdom, dev);
+        xendev->parent = parent;
+        xendev->is_clone = 1;
+
+        xen_be_try_clone(xendev);
+    }
+    else
     if (xendev->ops->alloc) {
         xendev->ops->alloc(xendev);
     }
@@ -367,6 +379,8 @@ static void xen_be_frontend_changed(struct XenLegacyDevice *xendev,
     }
 }
 
+static int xen_be_try_initialise(struct XenLegacyDevice *xendev);
+
 /* ------------------------------------------------------------- */
 /* Check for possible state transitions and perform them.        */
 
@@ -388,7 +402,7 @@ static int xen_be_try_setup(struct XenLegacyDevice *xendev)
         return -1;
     }
 
-    if (be_state != XenbusStateInitialising) {
+    if (be_state != XenbusStateInitialising && !xendev->is_clone) {
         xen_pv_printf(xendev, 0, "initial backend state is wrong (%s)\n",
                       xenbus_strstate(be_state));
         return -1;
@@ -407,7 +421,11 @@ static int xen_be_try_setup(struct XenLegacyDevice *xendev)
                       xendev->fe);
         return -1;
     }
-    xen_be_set_state(xendev, XenbusStateInitialising);
+
+    if (xendev->is_clone) {
+        xendev->be_state = XenbusStateConnected;
+    } else
+        xen_be_set_state(xendev, XenbusStateInitialising);
 
     xen_be_backend_changed(xendev, NULL);
     xen_be_frontend_changed(xendev, NULL);
@@ -510,6 +528,29 @@ static void xen_be_try_connected(struct XenLegacyDevice *xendev)
     xendev->ops->connected(xendev);
 }
 
+static int xen_be_try_clone(struct XenLegacyDevice *xendev)
+{
+    int rc;
+
+    if (xendev->ops->flags & DEVOPS_FLAG_NEED_GNTDEV) {
+        xendev->gnttabdev = xengnttab_open(NULL, 0);
+        if (xendev->gnttabdev == NULL) {
+            xen_pv_printf(NULL, 0, "can't open gnttab device\n");
+            return -1;
+        }
+    } else {
+        xendev->gnttabdev = NULL;
+    }
+
+    rc = xen_be_try_setup(xendev);
+
+    if (xendev->ops->clone) {
+        rc = xendev->ops->clone(xendev);
+    }
+
+    return rc;
+}
+
 /*
  * Teardown connection.
  *
@@ -591,7 +632,7 @@ void xen_be_check_state(struct XenLegacyDevice *xendev)
 
 /* ------------------------------------------------------------- */
 
-static int xenstore_scan(const char *type, int dom, struct XenDevOps *ops)
+static int xenstore_scan(const char *type, int dom, int parentdom, struct XenDevOps *ops)
 {
     struct XenLegacyDevice *xendev;
     char path[XEN_BUFSIZE], token[XEN_BUFSIZE];
@@ -613,11 +654,11 @@ static int xenstore_scan(const char *type, int dom, struct XenDevOps *ops)
         return 0;
     }
     for (j = 0; j < cdev; j++) {
-        xendev = xen_be_get_xendev(type, dom, atoi(dev[j]), ops);
+        xendev = xen_be_get_xendev(type, dom, parentdom, atoi(dev[j]), ops);
         if (xendev == NULL) {
             continue;
         }
-        xen_be_check_state(xendev);
+        xen_be_check_state(xendev);/* TODO needed for cloning? */
     }
     free(dev);
     return 0;
@@ -644,7 +685,7 @@ void xenstore_update_be(char *watch, char *type, int dom,
         return;
     }
 
-    xendev = xen_be_get_xendev(type, dom, dev, ops);
+    xendev = xen_be_get_xendev(type, dom, -1, dev, ops);
     if (xendev != NULL) {
         bepath = xs_read(xenstore, 0, xendev->be, &len);
         if (bepath == NULL) {
@@ -741,7 +782,7 @@ int xen_be_register(const char *type, struct XenDevOps *ops)
              type);
     xenstore_mkdir(path, XS_PERM_NONE);
 
-    return xenstore_scan(type, xen_domid, ops);
+    return xenstore_scan(type, xen_domid, -1, ops);
 }
 
 void xen_be_register_common(void)
@@ -775,6 +816,12 @@ int xen_be_bind_evtchn(struct XenLegacyDevice *xendev)
     return 0;
 }
 
+void qmp_xen_clone(int64_t domid, int64_t parentid, Error **errp)
+{
+#ifdef CONFIG_VIRTFS
+    xenstore_scan("9pfs", domid, parentid, &xen_9pfs_ops);
+#endif
+}
 
 static Property xendev_properties[] = {
     DEFINE_PROP_END_OF_LIST(),
