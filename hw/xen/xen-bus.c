@@ -448,7 +448,9 @@ static void xen_bus_realize(BusState *bus, Error **errp)
 {
     XenBus *xenbus = XEN_BUS(bus);
     unsigned int domid;
+#ifdef MY_BACKEND_WATCH
     Error *local_err = NULL;
+#endif
 
     trace_xen_bus_realize();
 
@@ -469,6 +471,7 @@ static void xen_bus_realize(BusState *bus, Error **errp)
 
     module_call_init(MODULE_INIT_XEN_BACKEND);
 
+#ifdef MY_BACKEND_WATCH
     xenbus->backend_watch =
         xen_bus_add_watch(xenbus, "", /* domain root node */
                           "backend", xen_bus_backend_changed, &local_err);
@@ -477,6 +480,7 @@ static void xen_bus_realize(BusState *bus, Error **errp)
         error_reportf_err(local_err,
                           "failed to set up enumeration watch: ");
     }
+#endif
 
     return;
 
