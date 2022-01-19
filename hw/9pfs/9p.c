@@ -3453,7 +3453,9 @@ static void coroutine_fn v9fs_wstat(void *opaque)
     /* do we need to sync the file? */
     if (donttouch_stat(&v9stat)) {
         err = v9fs_co_fsync(pdu, fidp, 0);
-        goto out;
+        if (err < 0) {
+            goto out;
+        }
     }
     if (v9stat.mode != -1) {
         uint32_t v9_mode;
